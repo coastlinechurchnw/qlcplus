@@ -222,3 +222,71 @@ this living plan.
 All work is on `midi-activate-only-buttons` in
 `/home/captain/projects/qlcplus/source`; the built executable is
 `/tmp/opencode/qlcplus-build/main/qlcplus`. Commits are local; no push requested.
+
+## Apple Silicon packaging follow-up
+
+### Report and investigation
+
+On the target Mac, the launcher opens but selecting either QLC+ or the Fixture
+Definition Editor exits without a visible application. Running either packaged
+program directly produces `killed`, while `./build/main/qlcplus` runs normally.
+The supplied `build.log` shows successful compilation, installation and DMG
+creation, with no explicit deployment error.
+
+The user verified both packaged executables and the build-tree executable with
+`codesign --verify --strict --verbose=4`: all are valid on disk. This rules out
+the initial hypothesis of invalid signatures on the primary executables. It
+does not verify loaded libraries or establish the actual SIGKILL cause; that
+requires a target-machine crash report or successful repaired-bundle launch.
+
+Source inspection identified concrete packaging omissions:
+
+- The app entry point is the launcher, but `macdeployqt` was not explicitly
+  given the two child executables for dependency deployment.
+- Final signing was conditional on a certificate identity and did not cover
+  local builds explicitly. The certificate branch signed resources as code and
+  modified child signatures after sealing the outer app.
+- Deployment/signing failures could be followed by DMG creation, and some
+  compiler/install failures incorrectly returned success.
+
+### Packaging correction
+
+`create-dmg.sh` now deploys both child executables explicitly and invokes
+`platforms/macos/sign_bundle.sh` after dependency rewriting and resource pruning.
+The helper signs actual Mach-O files, then nested code containers inside-out,
+and seals the outer app last. It checks the extra executables individually and
+the complete app with deep/strict verification. Symlinks and plain resources
+are not individually signed. Local builds use ad-hoc signing; certificate builds
+retain their identity, timestamp and application entitlements. A failed build,
+deployment, signing or verification step prevents DMG creation.
+
+### Repair and target-machine validation
+
+Copy the updated helper to the Mac checkout; it uses the adjacent existing
+`qlcplus.entitlements`. From the checkout root, repair the existing user bundle
+without rebuilding:
+
+```sh
+bash platforms/macos/sign_bundle.sh "$HOME/QLC+.app"
+"$HOME/QLC+.app/Contents/MacOS/qlcplus"
+```
+
+Then test the Fixture Definition Editor and both launcher choices. Rebuilding
+with the updated `create-dmg.sh` also includes the corrected deployment step.
+The signing helper repairs signatures, not missing libraries or incorrect load
+paths. If the repaired program still gets killed, capture its newest report
+under `~/Library/Logs/DiagnosticReports` and inspect the termination reason and
+named image before making further deployment changes.
+
+### Verification completed locally
+
+- `bash -n create-dmg.sh platforms/macos/sign_bundle.sh`: passed.
+- `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s platforms/macos/tests -p '*_test.py' -v`:
+  **8 tests passed**. These execute the real scripts against command stubs and
+  cover code/resource selection, space-containing paths, symlinks, nested
+  signing order, local/certificate modes, explicit `SIGNATURE=-`, deployment
+  arguments, QML pruning order, and failure propagation before DMG creation.
+- Independent Sol review found no remaining packaging-code blockers.
+- Actual Apple signing acceptance and repaired-bundle launch are still pending
+  on the target Mac. Linux-side tests verify orchestration, not macOS runtime
+  behavior; the reported kill is not yet confirmed resolved.
