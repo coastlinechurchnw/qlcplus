@@ -426,7 +426,7 @@ void VCButton::notifyFunctionStarting(quint32 fid, qreal intensity, bool exclude
             return;
     }
 
-    if (action() == VCButton::Toggle)
+    if (action() == VCButton::Toggle || action() == VCButton::SetOn)
     {
         Function *f = m_doc->function(m_function);
         if (f != NULL)
@@ -479,7 +479,7 @@ void VCButton::updateState()
         if (m_doc->inputOutputMap()->blackout())
             state = Active;
     }
-    else if (m_action == Toggle)
+    else if (m_action == Toggle || m_action == SetOn)
     {
         Function* function = m_doc->function(m_function);
         if (function != NULL && function->isRunning())
@@ -564,7 +564,7 @@ void VCButton::slotInputValueChanged(quint32 universe, quint32 channel, uchar va
         {
             if (value > 0)
             {
-                // Only toggle when the external button is pressed.
+                // Only act when the external button is pressed.
                 pressFunction();
             }
             else
@@ -615,6 +615,10 @@ QString VCButton::actionToString(VCButton::Action action)
         return QString(KXMLQLCVCButtonActionBlackout);
     else if (action == StopAll)
         return QString(KXMLQLCVCButtonActionStopAll);
+    else if (action == SetOn)
+        return QString(KXMLQLCVCButtonActionSetOn);
+    else if (action == SetOff)
+        return QString(KXMLQLCVCButtonActionSetOff);
     else
         return QString(KXMLQLCVCButtonActionToggle);
 }
@@ -627,6 +631,10 @@ VCButton::Action VCButton::stringToAction(const QString& str)
         return Blackout;
     else if (str == KXMLQLCVCButtonActionStopAll)
         return StopAll;
+    else if (str == KXMLQLCVCButtonActionSetOn)
+        return SetOn;
+    else if (str == KXMLQLCVCButtonActionSetOff)
+        return SetOff;
     else
         return Toggle;
 }
@@ -734,27 +742,24 @@ void VCButton::pressFunction()
         }
         else
         {
-            adjustFunctionIntensity(f, intensity());
-
-            // starting a Chaser is a special case, since it is necessary
-            // to use Chaser Actions to properly start the first
-            // Chaser step with the right intensity
-            if (f->type() == Function::ChaserType || f->type() == Function::SequenceType)
-            {
-                ChaserAction action;
-                action.m_action = ChaserSetStepIndex;
-                action.m_stepIndex = 0;
-                action.m_masterIntensity = intensity();
-                action.m_stepIntensity = 1.0;
-                action.m_fadeMode = Chaser::FromFunction;
-
-                Chaser *chaser = qobject_cast<Chaser*>(f);
-                chaser->setAction(action);
-            }
-
-            f->start(m_doc->masterTimer(), functionParent());
-            setState(Active);
-            emit functionStarting(m_function);
+            startFunction(f);
+        }
+    }
+    else if (m_action == SetOn)
+    {
+        f = m_doc->function(m_function);
+        // A stop request can precede the stopped signal and leave us Active.
+        // Do not restart an activation that is merely waiting in the start queue.
+        if (f != NULL && (state() != Active || f->stopped()))
+            startFunction(f);
+    }
+    else if (m_action == SetOff)
+    {
+        f = m_doc->function(m_function);
+        if (f != NULL && !f->stopped())
+        {
+            f->stop(functionParent());
+            resetIntensityOverrideAttribute();
         }
     }
     else if (m_action == Flash && state() == Inactive)
@@ -778,6 +783,31 @@ void VCButton::pressFunction()
         else
             m_doc->masterTimer()->fadeAndStopAll(stopAllFadeTime());
     }
+}
+
+void VCButton::startFunction(Function *f)
+{
+    adjustFunctionIntensity(f, intensity());
+
+    // starting a Chaser is a special case, since it is necessary
+    // to use Chaser Actions to properly start the first
+    // Chaser step with the right intensity
+    if (f->type() == Function::ChaserType || f->type() == Function::SequenceType)
+    {
+        ChaserAction action;
+        action.m_action = ChaserSetStepIndex;
+        action.m_stepIndex = 0;
+        action.m_masterIntensity = intensity();
+        action.m_stepIntensity = 1.0;
+        action.m_fadeMode = Chaser::FromFunction;
+
+        Chaser *chaser = qobject_cast<Chaser*>(f);
+        chaser->setAction(action);
+    }
+
+    f->start(m_doc->masterTimer(), functionParent());
+    setState(Active);
+    emit functionStarting(m_function);
 }
 
 FunctionParent VCButton::functionParent() const
@@ -805,8 +835,14 @@ void VCButton::releaseFunction()
 
 void VCButton::slotFunctionRunning(quint32 fid)
 {
-    if (fid == m_function && m_action == Toggle)
+    if (fid == m_function && (m_action == Toggle || m_action == SetOn))
     {
+        // A cancelled queued start still emits running when the timer drains it.
+        // It must not reclaim the solo selection from a newer activation.
+        Function *f = m_doc->function(m_function);
+        if (f != NULL && f->stopped())
+            return;
+
         if (state() == Inactive)
             setState(Monitoring);
         emit functionStarting(m_function);
@@ -815,8 +851,14 @@ void VCButton::slotFunctionRunning(quint32 fid)
 
 void VCButton::slotFunctionStopped(quint32 fid)
 {
-    if (fid == m_function && m_action == Toggle)
+    if (fid == m_function && (m_action == Toggle || m_action == SetOn))
     {
+        // Restarting a running function calls postRun before preRun. Keep the
+        // selected state when this notification belongs to the previous run.
+        Function *f = m_doc->function(m_function);
+        if (f != NULL && !f->stopped())
+            return;
+
         resetIntensityOverrideAttribute();
         setState(Inactive);
         blink(250);
@@ -825,8 +867,8 @@ void VCButton::slotFunctionStopped(quint32 fid)
 
 void VCButton::slotFunctionFlashing(quint32 fid, bool state)
 {
-    // Do not change the state of the button for Blackout or Stop All Functions buttons
-    if (m_action != Toggle && m_action != Flash)
+    // Only function-state buttons respond to flashing notifications.
+    if (m_action != Toggle && m_action != SetOn && m_action != Flash)
         return;
 
     if (fid != m_function)
@@ -834,7 +876,7 @@ void VCButton::slotFunctionFlashing(quint32 fid, bool state)
 
     // if the function was flashed by another button, and the function is still running, keep the button pushed
     Function* f = m_doc->function(m_function);
-    if (state == false && m_action == Toggle && f != NULL && f->isRunning())
+    if (state == false && (m_action == Toggle || m_action == SetOn) && f != NULL && f->isRunning())
     {
         return;
     }
@@ -1066,7 +1108,7 @@ void VCButton::paintEvent(QPaintEvent* e)
         option.state = QStyle::State_Sunken;
 
     /* Custom icons are always enabled, to see them in full color also in design mode */
-    if (m_action == Toggle || m_action == Flash)
+    if (m_action == Toggle || m_action == SetOn || m_action == SetOff || m_action == Flash)
         option.state |= QStyle::State_Enabled;
 
     /* Icon */

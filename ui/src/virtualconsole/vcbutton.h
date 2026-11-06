@@ -52,6 +52,8 @@ class QEvent;
 #define KXMLQLCVCButtonActionToggle     QStringLiteral("Toggle")
 #define KXMLQLCVCButtonActionBlackout   QStringLiteral("Blackout")
 #define KXMLQLCVCButtonActionStopAll    QStringLiteral("StopAll")
+#define KXMLQLCVCButtonActionSetOn      QStringLiteral("SetOn")
+#define KXMLQLCVCButtonActionSetOff     QStringLiteral("SetOff")
 
 #define KXMLQLCVCButtonFlashOverride    QStringLiteral("Override")
 #define KXMLQLCVCButtonFlashForceLTP    QStringLiteral("ForceLTP")
@@ -258,8 +260,10 @@ public:
      * Flash: Keep the function running as long as the button is kept down.
      * Blackout: Toggle blackout on/off.
      * StopAll: Stop all functions (panic button).
+     * SetOn: Start the assigned function without toggling it off.
+     * SetOff: Stop the assigned function without starting it.
      */
-    enum Action { Toggle, Flash, Blackout, StopAll };
+    enum Action { Toggle, Flash, Blackout, StopAll, SetOn, SetOff };
 
     /** Set this button's action */
     void setAction(Action action);
@@ -342,6 +346,7 @@ public:
     void blink(int ms);
 
 private:
+    void startFunction(Function *f);
     FunctionParent functionParent() const;
 
 protected slots:

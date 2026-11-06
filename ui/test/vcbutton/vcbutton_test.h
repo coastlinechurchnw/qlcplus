@@ -50,6 +50,18 @@ private slots:
     void toggle();
     void flash();
     void input();
+    void setInput_data();
+    void setInput();
+    void setOffMonitored_data();
+    void setOffMonitored();
+    void setSolo_data();
+    void setSolo();
+    void mixedSoloQueued_data();
+    void mixedSoloQueued();
+    void sharedAttachmentRestart();
+    void setXML_data();
+    void setXML();
+    void setProperties();
     void paint();
 
     // https://github.com/mcallegari/qlcplus/issues/116

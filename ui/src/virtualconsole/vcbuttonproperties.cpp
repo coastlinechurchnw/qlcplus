@@ -72,6 +72,11 @@ VCButtonProperties::VCButtonProperties(VCButton* button, Doc* doc)
         m_blackout->setChecked(true);
     else if (button->action() == VCButton::StopAll)
         m_stopAll->setChecked(true);
+    else if (button->action() == VCButton::SetOn || button->action() == VCButton::SetOff)
+    {
+        m_set->setChecked(true);
+        m_setMode->setCurrentIndex(button->action() == VCButton::SetOff ? 1 : 0);
+    }
     else
         m_toggle->setChecked(true);
     m_fadeOutTime = m_button->stopAllFadeTime();
@@ -96,6 +101,8 @@ VCButtonProperties::VCButtonProperties(VCButton* button, Doc* doc)
     connect(m_blackout, SIGNAL(toggled(bool)), this, SLOT(slotActionToggled()));
     connect(m_stopAll, SIGNAL(toggled(bool)), this, SLOT(slotActionToggled()));
     connect(m_flash, SIGNAL(toggled(bool)), this, SLOT(slotActionToggled()));
+    connect(m_set, SIGNAL(toggled(bool)), this, SLOT(slotActionToggled()));
+    connect(m_setMode, SIGNAL(currentIndexChanged(int)), this, SLOT(slotActionToggled()));
 
     connect(m_speedDialButton, SIGNAL(toggled(bool)),
             this, SLOT(slotSpeedDialToggle(bool)));
@@ -157,6 +164,9 @@ void VCButtonProperties::slotActionToggled()
 
     m_forceLTP->setEnabled(m_flash->isChecked());
     m_overridePriority->setEnabled(m_flash->isChecked());
+    m_setMode->setEnabled(m_set->isChecked());
+    if (m_set->isChecked() && m_setMode->currentIndex() == 1)
+        m_intensityGroup->setEnabled(false);
 }
 
 void VCButtonProperties::slotSpeedDialToggle(bool state)
@@ -222,6 +232,8 @@ void VCButtonProperties::accept()
 
     if (m_toggle->isChecked() == true)
         m_button->setAction(VCButton::Toggle);
+    else if (m_set->isChecked() == true)
+        m_button->setAction(m_setMode->currentIndex() == 1 ? VCButton::SetOff : VCButton::SetOn);
     else if (m_blackout->isChecked() == true)
         m_button->setAction(VCButton::Blackout);
     else if (m_stopAll->isChecked() == true)
@@ -241,4 +253,3 @@ void VCButtonProperties::accept()
 
     QDialog::accept();
 }
-

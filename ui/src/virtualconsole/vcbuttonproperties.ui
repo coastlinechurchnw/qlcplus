@@ -53,6 +53,37 @@
        </widget>
       </item>
       <item>
+       <layout class="QHBoxLayout" name="setActionLayout">
+        <item>
+         <widget class="QRadioButton" name="m_set">
+          <property name="toolTip">
+           <string>Set the assigned function on or off. Repeated presses leave it in the desired state.</string>
+          </property>
+          <property name="text">
+           <string>Set function</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QComboBox" name="m_setMode">
+          <property name="enabled">
+           <bool>false</bool>
+          </property>
+          <item>
+           <property name="text">
+            <string>On</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>Off</string>
+           </property>
+          </item>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item>
        <layout class="QHBoxLayout" name="horizontalLayout_4">
         <item>
          <widget class="QRadioButton" name="m_flash">

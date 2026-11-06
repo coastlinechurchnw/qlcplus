@@ -33,6 +33,8 @@
 #include "mastertimer.h"
 #include "qlcmacros.h"
 #include "vcbutton.h"
+#include "vcbuttonproperties.h"
+#include "vcsoloframe.h"
 #include "vcframe.h"
 #include "scene.h"
 #include "doc.h"
@@ -140,6 +142,10 @@ void VCButton_Test::action()
     QCOMPARE(VCButton::stringToAction("Toggle"), VCButton::Toggle);
     QCOMPARE(VCButton::stringToAction("Flash"), VCButton::Flash);
     QCOMPARE(VCButton::stringToAction("Foobar"), VCButton::Toggle);
+    QCOMPARE(VCButton::actionToString(VCButton::SetOn), QString("SetOn"));
+    QCOMPARE(VCButton::actionToString(VCButton::SetOff), QString("SetOff"));
+    QCOMPARE(VCButton::stringToAction("SetOn"), VCButton::SetOn);
+    QCOMPARE(VCButton::stringToAction("SetOff"), VCButton::SetOff);
 }
 
 void VCButton_Test::intensity()
@@ -287,6 +293,7 @@ void VCButton_Test::copy()
     btn.setKeySequence(QKeySequence(keySequenceB));
     btn.enableStartupIntensity(true);
     btn.setStartupIntensity(qreal(0.2));
+    btn.setAction(VCButton::SetOn);
 
     VCFrame parent(&w, m_doc);
     VCButton* copy = qobject_cast<VCButton*> (btn.createCopy(&parent));
@@ -294,10 +301,13 @@ void VCButton_Test::copy()
     QCOMPARE(copy->caption(), QString("Foobar"));
     QCOMPARE(copy->iconPath(), QString("../../../resources/icons/png/qlcplus.png"));
     QCOMPARE(copy->function(), sc->id());
-    QCOMPARE(copy->action(), VCButton::Flash);
+    QCOMPARE(copy->action(), VCButton::SetOn);
     QCOMPARE(copy->keySequence(), QKeySequence(keySequenceB));
     QCOMPARE(copy->isStartupIntensityEnabled(), true);
     QCOMPARE(copy->startupIntensity(), qreal(0.2));
+    btn.setAction(VCButton::SetOff);
+    QVERIFY(copy->copyFrom(&btn));
+    QCOMPARE(copy->action(), VCButton::SetOff);
     delete copy;
 }
 
@@ -675,6 +685,469 @@ void VCButton_Test::input()
     QTest::qWait(100);
     QCOMPARE(m_doc->masterTimer()->runningFunctions(), 0);
     m_doc->masterTimer()->stop();
+}
+
+void VCButton_Test::setInput_data()
+{
+    QTest::addColumn<int>("input");
+    QTest::newRow("mouse") << 0;
+    QTest::newRow("keyboard") << 1;
+    QTest::newRow("external") << 2;
+}
+
+void VCButton_Test::setInput()
+{
+    QFETCH(int, input);
+    QWidget w;
+    Scene* sc = new Scene(m_doc);
+    sc->setValue(0, 0, 255);
+    sc->setFadeInSpeed(1000);
+    m_doc->addFunction(sc);
+
+    VCButton btn(&w, m_doc);
+    btn.setID(10);
+    btn.setFunction(sc->id());
+    btn.setAction(VCButton::SetOn);
+    btn.setKeySequence(keySequenceA);
+    btn.setInputSource(QSharedPointer<QLCInputSource>(new QLCInputSource(0, 0)));
+    MasterTimer* timer = m_doc->masterTimer();
+    QSignalSpy started(sc, SIGNAL(running(quint32)));
+    auto press = [&]() {
+        if (input == 0)
+            QTest::mousePress(&btn, Qt::LeftButton);
+        else if (input == 1)
+            btn.slotKeyPressed(keySequenceA);
+        else
+            btn.slotInputValueChanged(0, 0, 127);
+    };
+    auto release = [&]() {
+        if (input == 0)
+            QTest::mouseRelease(&btn, Qt::LeftButton);
+        else if (input == 1)
+            btn.slotKeyReleased(keySequenceA);
+        else
+            btn.slotInputValueChanged(0, 0, 0);
+    };
+
+    // Design mode, unmatched input and NoteOff must not queue a start.
+    press();
+    QVERIFY(timer->m_startQueue.isEmpty());
+    m_doc->setMode(Doc::Operate);
+    btn.slotInputValueChanged(1, 0, 127);
+    btn.slotInputValueChanged(0, 1, 127);
+    btn.slotInputValueChanged(0, 0, 0);
+    QVERIFY(timer->m_startQueue.isEmpty());
+
+    press();
+    QCOMPARE(timer->m_startQueue.size(), 1);
+    QCOMPARE(timer->m_startQueue.first(), sc);
+    QCOMPARE(sc->m_sources.size(), 1);
+    QVERIFY(sc->m_sources.contains(btn.functionParent()));
+    QVERIFY(!sc->stopped());
+
+    // Repeated presses, including a release/press, before the timer starts
+    // the function must not cancel the queued activation.
+    press();
+    release();
+    press();
+    QVERIFY(!sc->stopped());
+    QCOMPARE(timer->m_startQueue.size(), 1);
+    timer->timerTick();
+    QCOMPARE(started.size(), 1);
+    QCOMPARE(timer->m_functionList.size(), 1);
+    QCOMPARE(timer->m_functionList.first(), sc);
+    QVERIFY(sc->isRunning());
+
+    // Stay inside the fade-in and verify duplicate selections do not reset it.
+    timer->timerTick();
+    timer->timerTick();
+    const quint32 elapsed = sc->elapsed();
+    QVERIFY(elapsed > 0);
+    QVERIFY(elapsed < sc->fadeInSpeed());
+
+    press();
+    press();
+    release(); // including MIDI NoteOff / zero velocity
+    QCOMPARE(sc->elapsed(), elapsed);
+    QVERIFY(timer->m_startQueue.isEmpty());
+    timer->timerTick();
+    QVERIFY(sc->elapsed() > elapsed);
+    QVERIFY(!sc->stopped());
+    QVERIFY(sc->isRunning());
+    QCOMPARE(sc->m_sources.size(), 1);
+    QVERIFY(sc->m_sources.contains(btn.functionParent()));
+    QVERIFY(timer->m_startQueue.isEmpty());
+    QCOMPARE(started.size(), 1);
+
+    btn.setAction(VCButton::SetOff);
+    btn.updateState(); // same state refresh performed by properties acceptance
+    QCOMPARE(btn.state(), VCButton::Inactive);
+    press();
+    QVERIFY(sc->stopped());
+    QVERIFY(sc->m_sources.isEmpty());
+    release();
+    press();
+    timer->timerTick();
+    QVERIFY(!sc->isRunning());
+    QCOMPARE(btn.state(), VCButton::Inactive);
+    QVERIFY(timer->m_startQueue.isEmpty());
+}
+
+void VCButton_Test::setOffMonitored_data()
+{
+    QTest::addColumn<bool>("takeOver");
+    QTest::newRow("monitored") << false;
+    QTest::newRow("set-on-takeover") << true;
+}
+
+void VCButton_Test::setOffMonitored()
+{
+    QFETCH(bool, takeOver);
+    QWidget w;
+    Scene* sc = new Scene(m_doc);
+    sc->setValue(0, 0, 255);
+    m_doc->addFunction(sc);
+    VCButton monitor(&w, m_doc);
+    monitor.setID(10);
+    monitor.setFunction(sc->id());
+    monitor.setAction(VCButton::SetOn);
+    VCButton off(&w, m_doc);
+    off.setFunction(sc->id());
+    off.setAction(VCButton::SetOff);
+    off.setKeySequence(keySequenceA);
+    QSignalSpy starting(&off, SIGNAL(functionStarting(quint32,qreal)));
+    QSignalSpy running(sc, SIGNAL(running(quint32)));
+    m_doc->setMode(Doc::Operate);
+    sc->start(m_doc->masterTimer(), FunctionParent::master());
+    m_doc->masterTimer()->timerTick();
+    QCOMPARE(monitor.state(), VCButton::Monitoring);
+    QCOMPARE(off.state(), VCButton::Inactive);
+    // SetOn must take ownership of a monitored attachment without restarting
+    // the already-running scene, then remain idempotent on repeated presses.
+    if (takeOver)
+    {
+        monitor.pressFunction();
+        monitor.pressFunction();
+        m_doc->masterTimer()->timerTick();
+        QCOMPARE(monitor.state(), VCButton::Active);
+        QVERIFY(sc->m_sources.contains(monitor.functionParent()));
+        QCOMPARE(running.size(), 1);
+    }
+    off.slotKeyPressed(keySequenceA);
+    off.slotKeyReleased(keySequenceA);
+    off.slotKeyPressed(keySequenceA);
+    QVERIFY(sc->stopped());
+    QVERIFY(sc->m_sources.isEmpty());
+    QCOMPARE(off.state(), VCButton::Inactive);
+    QCOMPARE(starting.size(), 0);
+    m_doc->masterTimer()->timerTick();
+    QVERIFY(!sc->isRunning());
+}
+
+void VCButton_Test::setSolo_data()
+{
+    QTest::addColumn<bool>("pendingStop");
+    QTest::newRow("completed-stop") << false;
+    QTest::newRow("reselect-before-stop-with-fade") << true;
+}
+
+void VCButton_Test::setSolo()
+{
+    QFETCH(bool, pendingStop);
+    QWidget w;
+    VCSoloFrame frame(&w, m_doc);
+    Scene* a = new Scene(m_doc);
+    a->setValue(0, 0, 255);
+    a->setFadeOutSpeed(pendingStop ? 25000 : 0);
+    m_doc->addFunction(a);
+    Scene* b = new Scene(m_doc);
+    b->setValue(0, 1, 255);
+    m_doc->addFunction(b);
+
+    VCButton buttonA(&frame, m_doc);
+    buttonA.setID(10);
+    buttonA.setFunction(a->id());
+    buttonA.setAction(VCButton::SetOn);
+    buttonA.setInputSource(QSharedPointer<QLCInputSource>(new QLCInputSource(0, 0)));
+    VCButton buttonB(&frame, m_doc);
+    buttonB.setID(11);
+    buttonB.setFunction(b->id());
+    buttonB.setAction(VCButton::SetOn);
+    buttonB.setInputSource(QSharedPointer<QLCInputSource>(new QLCInputSource(0, 1)));
+    VCButton off(&frame, m_doc);
+    off.setFunction(b->id());
+    off.setAction(VCButton::SetOff);
+    QSignalSpy starting(&off, SIGNAL(functionStarting(quint32,qreal)));
+
+    m_doc->setMode(Doc::Operate);
+    MasterTimer* timer = m_doc->masterTimer();
+    buttonA.slotInputValueChanged(0, 0, 127);
+    timer->timerTick();
+    QVERIFY(a->isRunning());
+    QVERIFY(a->m_sources.contains(buttonA.functionParent()));
+
+    buttonB.slotInputValueChanged(0, 1, 127);
+    QVERIFY(a->stopped());
+    QVERIFY(a->m_sources.isEmpty());
+    QVERIFY(b->m_sources.contains(buttonB.functionParent()));
+    if (!pendingStop)
+    {
+        timer->timerTick();
+        QVERIFY(!a->isRunning());
+        QVERIFY(b->isRunning());
+        QCOMPARE(buttonA.state(), VCButton::Inactive);
+    }
+    else
+    {
+        // Do not process the timer or deliver a synthetic stopped signal:
+        // A is still Active while its stop/fade is pending, B is queued.
+        QVERIFY(a->isRunning());
+        QCOMPARE(buttonA.state(), VCButton::Active);
+        QVERIFY(timer->m_startQueue.contains(b));
+    }
+
+    buttonA.slotInputValueChanged(0, 0, 127);
+    // Reselection must reclaim real function ownership, not just keep the LED
+    // active. In particular it must cancel A's pending stop and stop B.
+    QVERIFY2(a->m_sources.contains(buttonA.functionParent()),
+             "Reselecting A while its stop is pending must reclaim A's ownership");
+    QVERIFY(!a->stopped());
+    QVERIFY(b->stopped());
+    timer->timerTick();
+    timer->timerTick(); // also drain B if it was still queued on reselection
+    QVERIFY(a->isRunning());
+    QCOMPARE(buttonA.state(), VCButton::Active);
+    QVERIFY(a->m_sources.contains(buttonA.functionParent()));
+    QVERIFY(!b->isRunning());
+    QCOMPARE(timer->m_functionList.size(), 1);
+    QCOMPARE(timer->m_functionList.first(), a);
+
+    // An Off button for B must neither announce a solo selection nor stop A.
+    off.pressFunction();
+    off.pressFunction();
+    QVERIFY(!a->stopped());
+    QVERIFY(a->m_sources.contains(buttonA.functionParent()));
+    QCOMPARE(off.state(), VCButton::Inactive);
+    QCOMPARE(starting.size(), 0);
+}
+
+void VCButton_Test::mixedSoloQueued_data()
+{
+    QTest::addColumn<bool>("toggleFirst");
+    QTest::newRow("toggle-then-set-on") << true;
+    QTest::newRow("set-on-then-toggle") << false;
+}
+
+void VCButton_Test::mixedSoloQueued()
+{
+    QFETCH(bool, toggleFirst);
+    QWidget w;
+    VCSoloFrame frame(&w, m_doc);
+    Scene* a = new Scene(m_doc);
+    a->setValue(0, 0, 255);
+    m_doc->addFunction(a);
+    Scene* b = new Scene(m_doc);
+    b->setValue(0, 1, 255);
+    m_doc->addFunction(b);
+    VCButton buttonA(&frame, m_doc);
+    buttonA.setID(10);
+    buttonA.setFunction(a->id());
+    buttonA.setAction(toggleFirst ? VCButton::Toggle : VCButton::SetOn);
+    VCButton buttonB(&frame, m_doc);
+    buttonB.setID(11);
+    buttonB.setFunction(b->id());
+    buttonB.setAction(toggleFirst ? VCButton::SetOn : VCButton::Toggle);
+    QSignalSpy runningA(a, SIGNAL(running(quint32)));
+    QSignalSpy selectingA(&buttonA, SIGNAL(functionStarting(quint32,qreal)));
+    m_doc->setMode(Doc::Operate);
+    MasterTimer* timer = m_doc->masterTimer();
+
+    // Both activations are still queued when B cancels A. Draining the
+    // cancelled start really emits running(), but must not reselect A.
+    buttonA.pressFunction();
+    buttonB.pressFunction();
+    QCOMPARE(timer->m_startQueue.size(), 2);
+    QVERIFY(a->stopped());
+    QVERIFY(a->m_sources.isEmpty());
+    QVERIFY(!b->stopped());
+    QVERIFY(b->m_sources.contains(buttonB.functionParent()));
+    QCOMPARE(selectingA.size(), 1);
+    timer->timerTick();
+    QCOMPARE(runningA.size(), 1);
+    QCOMPARE(selectingA.size(), 1);
+    QVERIFY(!b->stopped());
+    QVERIFY(b->m_sources.contains(buttonB.functionParent()));
+    timer->timerTick(); // remove cancelled A from the execution list
+    QVERIFY(!a->isRunning());
+    QCOMPARE(buttonA.state(), VCButton::Inactive);
+    QCOMPARE(buttonB.state(), VCButton::Active);
+    QCOMPARE(timer->m_functionList.size(), 1);
+    QCOMPARE(timer->m_functionList.first(), b);
+
+    // Both action combinations must still allow selecting A normally later.
+    buttonA.pressFunction();
+    QVERIFY(!a->stopped());
+    QVERIFY(a->m_sources.contains(buttonA.functionParent()));
+    QVERIFY(b->stopped());
+    QVERIFY(b->m_sources.isEmpty());
+    timer->timerTick();
+    QVERIFY(a->isRunning());
+    QVERIFY(!b->isRunning());
+    QCOMPARE(timer->m_functionList.size(), 1);
+    QCOMPARE(timer->m_functionList.first(), a);
+}
+
+void VCButton_Test::sharedAttachmentRestart()
+{
+    QWidget w;
+    Scene* sc = new Scene(m_doc);
+    sc->setValue(0, 0, 255);
+    m_doc->addFunction(sc);
+    VCButton toggle(&w, m_doc);
+    toggle.setID(10);
+    toggle.setFunction(sc->id());
+    toggle.enableStartupIntensity(true);
+    toggle.setStartupIntensity(qreal(0.4));
+    VCButton on(&w, m_doc);
+    on.setID(11);
+    on.setFunction(sc->id());
+    on.setAction(VCButton::SetOn);
+    on.enableStartupIntensity(true);
+    on.setStartupIntensity(qreal(0.4));
+    m_doc->setMode(Doc::Operate);
+    MasterTimer* timer = m_doc->masterTimer();
+    toggle.pressFunction();
+    timer->timerTick();
+    on.pressFunction();
+    QCOMPARE(toggle.state(), VCButton::Active);
+    QCOMPARE(on.state(), VCButton::Active);
+    const int toggleIntensity = toggle.m_intensityOverrideId;
+    const int onIntensity = on.m_intensityOverrideId;
+    QVERIFY(toggleIntensity != Function::invalidAttributeId());
+    QVERIFY(onIntensity != Function::invalidAttributeId());
+
+    // Request an attribute-preserving stop, then reselect before the timer
+    // processes it. Restarting the same running Scene invokes postRun/preRun.
+    sc->stop(FunctionParent::master(), true);
+    on.pressFunction();
+    QVERIFY(!sc->stopped());
+    QVERIFY(sc->m_sources.contains(on.functionParent()));
+    QSignalSpy stopped(sc, SIGNAL(stopped(quint32)));
+    QSignalSpy toggleStates(&toggle, SIGNAL(stateChanged(int)));
+    timer->timerTick();
+    QCOMPARE(stopped.size(), 1); // a real intermediate stopped notification
+    QVERIFY(sc->isRunning());
+    QVERIFY(!sc->stopped());
+    QCOMPARE(toggle.state(), VCButton::Active);
+    QCOMPARE(on.state(), VCButton::Active);
+    QCOMPARE(toggleStates.size(), 0);
+    QCOMPARE(toggle.m_intensityOverrideId, toggleIntensity);
+    QCOMPARE(on.m_intensityOverrideId, onIntensity);
+    QCOMPARE(sc->getAttributeValue(Function::Intensity), qreal(0.4));
+    QCOMPARE(timer->m_functionList.size(), 1);
+    QVERIFY(timer->m_startQueue.isEmpty());
+}
+
+void VCButton_Test::setXML_data()
+{
+    QTest::addColumn<QString>("actionXML");
+    QTest::addColumn<int>("action");
+    QTest::newRow("missing") << QString() << int(VCButton::Toggle);
+    QTest::newRow("legacy-toggle") << QString("<Action>Toggle</Action>") << int(VCButton::Toggle);
+    QTest::newRow("set-on") << QString("<Action>SetOn</Action>") << int(VCButton::SetOn);
+    QTest::newRow("set-off") << QString("<Action>SetOff</Action>") << int(VCButton::SetOff);
+}
+
+void VCButton_Test::setXML()
+{
+    QFETCH(QString, actionXML);
+    QFETCH(int, action);
+    QWidget w;
+    VCButton btn(&w, m_doc);
+    QBuffer input;
+    input.setData(QString("<Button>%1</Button>").arg(actionXML).toUtf8());
+    QVERIFY(input.open(QIODevice::ReadOnly | QIODevice::Text));
+    QXmlStreamReader reader(&input);
+    QVERIFY(reader.readNextStartElement());
+    QVERIFY(btn.loadXML(reader));
+    QVERIFY(!reader.hasError());
+    QCOMPARE(int(btn.action()), action);
+
+    QBuffer buffer;
+    QVERIFY(buffer.open(QIODevice::WriteOnly | QIODevice::Text));
+    QXmlStreamWriter writer(&buffer);
+    QVERIFY(btn.saveXML(&writer));
+    writer.setDevice(NULL);
+    buffer.close();
+    QVERIFY(buffer.open(QIODevice::ReadOnly | QIODevice::Text));
+    QXmlStreamReader saved(&buffer);
+    QVERIFY(saved.readNextStartElement());
+    int actions = 0;
+    while (saved.readNextStartElement())
+    {
+        if (saved.name() == "Action")
+        {
+            ++actions;
+            QCOMPARE(saved.readElementText(), VCButton::actionToString(VCButton::Action(action)));
+        }
+        else
+            saved.skipCurrentElement();
+    }
+    QCOMPARE(actions, 1);
+    VCButton restored(&w, m_doc);
+    QVERIFY(buffer.seek(0));
+    QXmlStreamReader roundtrip(&buffer);
+    QVERIFY(roundtrip.readNextStartElement());
+    QVERIFY(restored.loadXML(roundtrip));
+    QVERIFY(!roundtrip.hasError());
+    QCOMPARE(int(restored.action()), action);
+}
+
+void VCButton_Test::setProperties()
+{
+    QWidget w;
+    VCButton btn(&w, m_doc);
+    {
+        VCButtonProperties prop(&btn, m_doc);
+        QVERIFY(!prop.m_setMode->isEnabled());
+        prop.m_set->setChecked(true);
+        QVERIFY(prop.m_setMode->isEnabled());
+        QCOMPARE(prop.m_setMode->currentIndex(), 0);
+        prop.accept();
+    }
+    QCOMPARE(btn.action(), VCButton::SetOn);
+    {
+        VCButtonProperties prop(&btn, m_doc);
+        QVERIFY(prop.m_set->isChecked());
+        QCOMPARE(prop.m_setMode->currentIndex(), 0);
+        prop.m_flash->setChecked(true);
+        QVERIFY(!prop.m_setMode->isEnabled());
+        prop.m_blackout->setChecked(true);
+        QVERIFY(!prop.m_setMode->isEnabled());
+        prop.m_stopAll->setChecked(true);
+        QVERIFY(!prop.m_setMode->isEnabled());
+        prop.m_toggle->setChecked(true);
+        QVERIFY(!prop.m_setMode->isEnabled());
+        prop.m_set->setChecked(true);
+        prop.m_setMode->setCurrentIndex(1);
+        prop.reject();
+    }
+    QCOMPARE(btn.action(), VCButton::SetOn);
+    {
+        VCButtonProperties prop(&btn, m_doc);
+        prop.m_setMode->setCurrentIndex(1);
+        prop.accept();
+    }
+    QCOMPARE(btn.action(), VCButton::SetOff);
+    {
+        VCButtonProperties prop(&btn, m_doc);
+        QVERIFY(prop.m_set->isChecked());
+        QVERIFY(prop.m_setMode->isEnabled());
+        QCOMPARE(prop.m_setMode->currentIndex(), 1);
+        prop.m_setMode->setCurrentIndex(0);
+        prop.accept();
+    }
+    QCOMPARE(btn.action(), VCButton::SetOn);
 }
 
 void VCButton_Test::paint()
