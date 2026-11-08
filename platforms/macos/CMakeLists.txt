@@ -10,11 +10,12 @@ install(FILES ../../resources/icons/qlcplus.icns DESTINATION ${INSTALLROOT}/${DA
 install(FILES qlcplus.entitlements DESTINATION ${INSTALLROOT}/${DATADIR} RENAME .entitlements)
 
 if(qmlui)
-    install(FILES Info.plist.qmlui DESTINATION ${INSTALLROOT} RENAME Info.plist)
+    set(QLC_INFO_PLIST_TEMPLATE Info.plist.qmlui)
 else()
-    install(FILES Info.plist DESTINATION ${INSTALLROOT})
+    set(QLC_INFO_PLIST_TEMPLATE Info.plist)
 endif()
-install(CODE "execute_process(COMMAND sed -i -e \"s/__QLC_VERSION__/${APPVERSION}/g\" ${INSTALLROOT}/Info.plist)")
+configure_file("${QLC_INFO_PLIST_TEMPLATE}" "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" @ONLY)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" DESTINATION ${INSTALLROOT})
 
 set(APPLE_CODESIGN_ENTITLEMENTS "qlcplus.entitlements")
 
