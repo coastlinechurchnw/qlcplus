@@ -236,8 +236,12 @@ creation, with no explicit deployment error.
 The user verified both packaged executables and the build-tree executable with
 `codesign --verify --strict --verbose=4`: all are valid on disk. This rules out
 the initial hypothesis of invalid signatures on the primary executables. It
-does not verify loaded libraries or establish the actual SIGKILL cause; that
-requires a target-machine crash report or successful repaired-bundle launch.
+does not verify loaded libraries. The subsequently supplied launcher crash
+report establishes `EXC_BAD_ACCESS / SIGKILL (Code Signature Invalid)`,
+`CODESIGNING`, code 2, `Invalid Page`, while Qt loads platform integration.
+It confirms native ARM64 and Qt 6.10.2, but the offending mapped library has no
+pathname in the report; neither libogg/libvorbis nor the platform plugin can be
+identified as the exact failed image from that report alone.
 
 Source inspection identified concrete packaging omissions:
 
@@ -260,15 +264,49 @@ are not individually signed. Local builds use ad-hoc signing; certificate builds
 retain their identity, timestamp and application entitlements. A failed build,
 deployment, signing or verification step prevents DMG creation.
 
+The next target build exposed two concrete blockers and an ordering defect:
+
+- BSD `sed -i -e` created `Contents/Info.plist-e`. Signing rejected that unexpected
+  bundle subcomponent. CMake now uses `configure_file(... @ONLY)` to generate the
+  selected v4/v5 Info.plist in the build tree before installation; no backup is
+  created and the source templates remain unchanged.
+- Homebrew codec libraries copied with `cp` retained read-only permissions.
+  `macdeployqt` reported permission errors while stripping libogg and libvorbis.
+  The dependency helper now makes independent bundle copies owner-writable,
+  including existing copies. Existing symlink aliases are materialized before
+  chmod so their original targets are not modified. It also skips a dylib's own
+  install ID, resolves loader-relative paths from the actual image first, and
+  propagates dependency-tool errors.
+- Signing a bundle's `CFBundleExecutable` directly can inspect the enclosing
+  bundle before the remaining nested code is signed. The signing helper now
+  reads actual plist metadata, defers these main executables to their container
+  signing pass, and still signs additional standalone programs individually.
+  This includes versioned Qt frameworks without traversing their aliases.
+
+Warnings that `install_name_tool` invalidates signatures are expected during
+deployment mutations; signing must complete afterward. Permission failures and
+the `Info.plist-e` rejection are actual blockers, not ignorable warnings.
+
 ### Repair and target-machine validation
 
-Copy the updated helper to the Mac checkout; it uses the adjacent existing
-`qlcplus.entitlements`. From the checkout root, repair the existing user bundle
-without rebuilding:
+Copy the updated changes to the Mac checkout; the signing helper uses the
+adjacent existing `qlcplus.entitlements`. From the checkout root, repair the
+existing user bundle without rebuilding. Remove only the known generated plist
+backup, repair the regular bundled dylib permissions, rerun Qt deployment, and
+finally sign:
 
 ```sh
-bash platforms/macos/sign_bundle.sh "$HOME/QLC+.app"
-"$HOME/QLC+.app/Contents/MacOS/qlcplus"
+(
+  set -e
+  APP="$HOME/QLC+.app"
+  rm -f "$APP/Contents/Info.plist-e"
+  find "$APP/Contents/Frameworks" -type f -name '*.dylib' -exec chmod u+w {} +
+  "$QTDIR/bin/macdeployqt" "$APP" \
+    "-executable=$APP/Contents/MacOS/qlcplus" \
+    "-executable=$APP/Contents/MacOS/qlcplus-fixtureeditor"
+  bash platforms/macos/sign_bundle.sh "$APP"
+)
+QT_DEBUG_PLUGINS=1 "$HOME/QLC+.app/Contents/MacOS/qlcplus"
 ```
 
 Then test the Fixture Definition Editor and both launcher choices. Rebuilding
@@ -281,12 +319,17 @@ named image before making further deployment changes.
 ### Verification completed locally
 
 - `bash -n create-dmg.sh platforms/macos/sign_bundle.sh`: passed.
+- `bash -n platforms/macos/fix_dylib_deps.sh`: passed.
 - `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s platforms/macos/tests -p '*_test.py' -v`:
-  **8 tests passed**. These execute the real scripts against command stubs and
-  cover code/resource selection, space-containing paths, symlinks, nested
-  signing order, local/certificate modes, explicit `SIGNATURE=-`, deployment
-  arguments, QML pruning order, and failure propagation before DMG creation.
+  **22 tests passed**: 10 signing/packaging tests, 9 dependency tests, and 3 native
+  CMake plist-generation/install tests. These execute the real scripts/CMake
+  rules with isolated fixtures and command stubs where Apple tools are needed.
+  Coverage includes metadata-aware inside-out signing, standalone executables,
+  read-only library copies, symlink materialization, original-file preservation,
+  install IDs, loader-relative resolution, version/template substitution,
+  space-containing paths, local/certificate modes, QML pruning, and failure
+  propagation before DMG creation.
 - Independent Sol review found no remaining packaging-code blockers.
 - Actual Apple signing acceptance and repaired-bundle launch are still pending
   on the target Mac. Linux-side tests verify orchestration, not macOS runtime
-  behavior; the reported kill is not yet confirmed resolved.
+  behavior; the confirmed signature kill is not yet confirmed resolved.

@@ -31,6 +31,41 @@ fi
 # Do not follow symlinks: framework aliases must not be signed a second time.
 MANIFEST=$(mktemp "${TMPDIR:-/tmp}/qlcplus-sign.XXXXXX")
 trap 'rm -f "$MANIFEST"' EXIT
+# PlistBuddy predates macOS 10.13; unlike plutil's raw extraction it does not
+# require a recent macOS. Keep PATH overrides available for packaging tests.
+PATH="$PATH:/usr/libexec"
+export PATH
+if ! command -v PlistBuddy >/dev/null; then
+    echo "PlistBuddy is required to identify bundle executables" >&2
+    exit 1
+fi
+BUNDLE_EXECUTABLES=()
+find "$APP_DIR/Contents" -type f -name Info.plist -print0 > "$MANIFEST"
+while IFS= read -r -d '' plist; do
+    case "$plist" in
+        *.app/Contents/Info.plist|*.xpc/Contents/Info.plist|\
+        *.appex/Contents/Info.plist|*.bundle/Contents/Info.plist)
+            executable_dir=${plist%/Info.plist}/MacOS ;;
+        *.framework/Resources/Info.plist|*.framework/Versions/*/Resources/Info.plist)
+            executable_dir=${plist%/Resources/Info.plist} ;;
+        *.bundle/Info.plist|*.xpc/Info.plist|*.appex/Info.plist)
+            executable_dir=${plist%/Info.plist} ;;
+        *) continue ;;
+    esac
+    # Malformed metadata is an error; a valid resource-only bundle may omit
+    # CFBundleExecutable. Never interpolate plist data into a command string.
+    plutil -lint "$plist"
+    if ! executable=$(PlistBuddy -c 'Print :CFBundleExecutable' "$plist" 2>/dev/null); then
+        continue
+    fi
+    case "$executable" in
+        ''|.|..|*/*)
+            echo "Invalid CFBundleExecutable in $plist" >&2
+            exit 1 ;;
+    esac
+    BUNDLE_EXECUTABLES+=("$executable_dir/$executable")
+done < "$MANIFEST"
+
 MACHO_FILES=()
 find "$APP_DIR/Contents" -type f -print0 > "$MANIFEST"
 while IFS= read -r -d '' path; do
@@ -38,6 +73,18 @@ while IFS= read -r -d '' path; do
     case "$description" in
         *Mach-O*)
             MACHO_FILES+=("$path")
+            # Signing a CFBundleExecutable directly may sign its containing
+            # bundle too. Defer it until all that bundle's nested code is signed.
+            is_bundle_executable=false
+            for executable in "${BUNDLE_EXECUTABLES[@]}"; do
+                if [ "$path" = "$executable" ]; then
+                    is_bundle_executable=true
+                    break
+                fi
+            done
+            if [ "$is_bundle_executable" = true ]; then
+                continue
+            fi
             case "$path" in
                 */Contents/MacOS/*)
                     codesign "${SIGN_ARGS[@]}" "${APP_ARGS[@]}" "$path"

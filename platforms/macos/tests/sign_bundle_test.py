@@ -9,6 +9,7 @@ host build tools, Qt installation, macOS utilities, or real HOME are touched.
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -33,7 +34,9 @@ STUB = r'''
 import json
 import os
 from pathlib import Path
+import plistlib
 import sys
+from xml.parsers.expat import ExpatError
 
 tool = Path(sys.argv[0]).name
 args = sys.argv[1:]
@@ -57,7 +60,28 @@ if (os.environ.get("TEST_FAIL_TOOL") == tool
     print("injected failure: " + tool + " " + phase, file=sys.stderr)
     sys.exit(79)
 
-if tool == "file":
+if (tool == "codesign" and phase == "sign"
+        and os.environ.get("TEST_REJECT_DIRECT_CFEXEC") == "1"
+        and args[-1] in json.loads(os.environ.get("TEST_CFEXEC", "[]"))):
+    print("direct CFBundleExecutable signing rejected: " + args[-1], file=sys.stderr)
+    sys.exit(80)
+
+if tool in ("plutil", "PlistBuddy"):
+    expected = ["-lint"] if tool == "plutil" else ["-c", "Print :CFBundleExecutable"]
+    if args[:-1] != expected:
+        print("unexpected plist command: " + repr(args), file=sys.stderr)
+        sys.exit(81)
+    try:
+        with open(args[-1], "rb") as source:
+            metadata = plistlib.load(source)
+    except (ValueError, OSError, plistlib.InvalidFileException, ExpatError) as error:
+        print("invalid plist: " + str(error), file=sys.stderr)
+        sys.exit(1)
+    if tool == "PlistBuddy":
+        if "CFBundleExecutable" not in metadata:
+            sys.exit(1)
+        print(metadata["CFBundleExecutable"])
+elif tool == "file":
     path = Path(args[-1])
     print("Mach-O 64-bit arm64 executable" if path.read_bytes().startswith(b"MACHO")
           else "ASCII text")
@@ -97,9 +121,11 @@ class SigningHarness(unittest.TestCase):
             TEST_LOG=str(self.log),
             TEST_PRUNED=json.dumps(PRUNED),
             TEST_INSTALL="{}",
+            TEST_REJECT_DIRECT_CFEXEC="1",
+            TEST_CFEXEC="[]",
         )
         for name in ("file", "codesign", "cmake", "make", "sysctl", "macdeployqt",
-                     "fix_dylib_deps.sh", "create-dmg"):
+                     "fix_dylib_deps.sh", "create-dmg", "plutil", "PlistBuddy"):
             path = self.bin / name
             path.write_text("#!" + sys.executable + "\n" + STUB)
             path.chmod(0o755)
@@ -135,8 +161,8 @@ class SignBundleTests(SigningHarness):
     def setUp(self):
         super().setUp()
         self.machos = [
+            "Contents/MacOS/qlcplus-launcher",
             "Contents/MacOS/qlcplus",
-            "Contents/MacOS/qlcplus-main",
             "Contents/MacOS/qlcplus-fixtureeditor",
             "Contents/Frameworks/lib sound.1.dylib",
             "Contents/PlugIns/platforms/libqcocoa.dylib",
@@ -145,6 +171,7 @@ class SignBundleTests(SigningHarness):
             "Contents/XPCServices/Service.xpc/Contents/MacOS/service",
             "Contents/PlugIns/Extension.appex/Contents/MacOS/extension",
             "Contents/PlugIns/Code.bundle/Contents/MacOS/plugin",
+            "Contents/PlugIns/Raw Plugin.bundle/rawplugin",
         ]
         self.containers = [
             "Contents/Frameworks/Test Kit.framework",
@@ -152,21 +179,41 @@ class SignBundleTests(SigningHarness):
             "Contents/XPCServices/Service.xpc",
             "Contents/PlugIns/Extension.appex",
             "Contents/PlugIns/Code.bundle",
+            "Contents/PlugIns/Raw Plugin.bundle",
         ]
         for relative in self.machos:
             self.write(relative, "MACHO fixture\n")
         self.resources = [
-            "Contents/Info.plist", "Contents/Resources/read me.txt",
+            "Contents/Resources/read me.txt",
             "Contents/Resources/Styles.bundle/theme.css",
             "Contents/MacOS/not-a-mach-o",
         ]
         for relative in self.resources:
             self.write(relative)
         (self.app / self.resources[-1]).chmod(0o755)
+        self.entrypoints = [self.machos[i] for i in (0, 5, 6, 7, 8, 9)]
+        self.plists = {
+            "Contents/Info.plist": "qlcplus-launcher",
+            "Contents/Frameworks/Test Kit.framework/Versions/A/Resources/Info.plist": "Test Kit",
+            self.containers[1] + "/Contents/Info.plist": "worker",
+            self.containers[2] + "/Contents/Info.plist": "service",
+            self.containers[3] + "/Contents/Info.plist": "extension",
+            self.containers[4] + "/Contents/Info.plist": "plugin",
+            self.containers[5] + "/Info.plist": None,
+            "Contents/Resources/Styles.bundle/Info.plist": None,
+        }
+        for relative, executable in self.plists.items():
+            metadata = {"CFBundleIdentifier": "org.qlcplus.test"}
+            if executable is not None:
+                metadata["CFBundleExecutable"] = executable
+            self.write(relative, plistlib.dumps(metadata).decode())
+        self.resources.extend(self.plists)
+        self.env["TEST_CFEXEC"] = json.dumps([str(self.app / p) for p in self.entrypoints])
         framework = self.app / self.containers[0]
         (framework / "Versions/Current").symlink_to("A", target_is_directory=True)
         (framework / "Test Kit").symlink_to("Versions/Current/Test Kit")
-        (self.app / "Contents/MacOS/launcher alias").symlink_to("qlcplus")
+        (framework / "Resources").symlink_to("Versions/Current/Resources", target_is_directory=True)
+        (self.app / "Contents/MacOS/launcher alias").symlink_to("qlcplus-launcher")
         (self.app / "Contents/Frameworks/framework alias").symlink_to(
             "Test Kit.framework", target_is_directory=True)
 
@@ -176,10 +223,19 @@ class SignBundleTests(SigningHarness):
         self.assert_success(result)
         signed = self.calls_for("codesign", "sign")
         targets = [c["args"][-1] for c in signed]
-        expected = [str(self.app / p) for p in self.machos + self.containers]
+        expected = [str(self.app / p) for p in self.machos + self.containers
+                    if p not in self.entrypoints]
         expected.append(str(self.app))
         self.assertCountEqual(targets, expected)
         self.assertEqual(targets[-1], str(self.app))
+        for entrypoint in self.entrypoints:
+            self.assertNotIn(str(self.app / entrypoint), targets)
+        for tool in ("plutil", "PlistBuddy"):
+            metadata_calls = self.calls_for(tool)
+            self.assertCountEqual([c["args"][-1] for c in metadata_calls],
+                                  [str(self.app / p) for p in self.plists])
+            self.assertTrue(all(self.calls.index(c) < self.calls.index(signed[0])
+                                for c in metadata_calls))
         for container in self.containers:
             enclosing = str(self.app / container)
             for target in targets:
@@ -264,6 +320,22 @@ class SignBundleTests(SigningHarness):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(self.calls_for("codesign"))
 
+    def test_malformed_bundle_metadata_fails_before_any_signing(self):
+        for relative in ("Contents/Info.plist",
+                         "Contents/Frameworks/Test Kit.framework/Versions/A/Resources/Info.plist",
+                         "Contents/Resources/Styles.bundle/Info.plist"):
+            with self.subTest(plist=relative):
+                path = self.app / relative
+                original = path.read_bytes()
+                try:
+                    path.write_text("<plist><dict>malformed")
+                    result = self.run_script(HELPER, self.app)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("invalid plist", result.stderr)
+                    self.assertFalse(self.calls_for("codesign"))
+                finally:
+                    path.write_bytes(original)
+
 
 class CreateDmgTests(SigningHarness):
     def setUp(self):
@@ -285,13 +357,15 @@ class CreateDmgTests(SigningHarness):
         (qt / "bin").mkdir(parents=True)
         shutil.copy2(self.bin / "macdeployqt", qt / "bin/macdeployqt")
         self.install = {
+            "Contents/MacOS/qlcplus-launcher": "MACHO launcher\n",
             "Contents/MacOS/qlcplus": "MACHO main\n",
             "Contents/MacOS/qlcplus-fixtureeditor": "MACHO editor\n",
             "Contents/Frameworks/libsndfile.1.dylib": "MACHO dependency\n",
-            "Contents/Info.plist": "resource\n",
+            "Contents/Info.plist": plistlib.dumps({"CFBundleExecutable": "qlcplus-launcher"}).decode(),
         }
         self.env.update(HOME=str(self.home), QTDIR=str(qt), TEST_APP=str(self.app),
-                        TEST_INSTALL=json.dumps(self.install))
+                        TEST_INSTALL=json.dumps(self.install),
+                        TEST_CFEXEC=json.dumps([str(self.app / "Contents/MacOS/qlcplus-launcher")]))
 
     def package(self, *args, overrides=None):
         return self.run_script(self.checkout / "create-dmg.sh", *args,
@@ -316,7 +390,8 @@ class CreateDmgTests(SigningHarness):
                 # including when SIGNATURE is the nonempty ad-hoc identity.
                 self.assertCountEqual([c["args"][-1] for c in signs],
                                       [str(self.app / p) for p in self.install
-                                       if p != "Contents/Info.plist"] + [str(self.app)])
+                                       if p not in ("Contents/Info.plist", "Contents/MacOS/qlcplus-launcher")]
+                                      + [str(self.app)])
                 for call in signs:
                     args = call["args"]
                     self.assertEqual(args[args.index("--sign") + 1], "-")
@@ -332,10 +407,15 @@ class CreateDmgTests(SigningHarness):
 
     def test_qml_pruning_precedes_real_signing_helper(self):
         install = dict(self.install)
+        del install["Contents/MacOS/qlcplus-launcher"]
         del install["Contents/MacOS/qlcplus"]
         del install["Contents/MacOS/qlcplus-fixtureeditor"]
         install["Contents/MacOS/qlcplus-qml"] = "MACHO qml\n"
-        result = self.package("qmlui", overrides={"TEST_INSTALL": json.dumps(install)})
+        install["Contents/Info.plist"] = plistlib.dumps({"CFBundleExecutable": "qlcplus-qml"}).decode()
+        result = self.package("qmlui", overrides={
+            "TEST_INSTALL": json.dumps(install),
+            "TEST_CFEXEC": json.dumps([str(self.app / "Contents/MacOS/qlcplus-qml")]),
+        })
         self.assert_success(result)
         self.assertEqual(self.calls_for("macdeployqt")[0]["args"],
                          [str(self.app), "-qmldir=qmlui/qml"])
@@ -345,6 +425,16 @@ class CreateDmgTests(SigningHarness):
             self.assertEqual(call["unpruned"], [])
         self.assertTrue((self.app / "Contents/Resources/qml/QtQuick/KeepMe/qmldir").is_file())
         self.assertEqual(len(self.calls_for("create-dmg")), 1)
+
+    def test_malformed_installed_metadata_prevents_signing_and_dmg(self):
+        install = dict(self.install)
+        install["Contents/Info.plist"] = "<plist><dict>malformed"
+        result = self.package(overrides={"TEST_INSTALL": json.dumps(install)})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid plist", result.stderr)
+        self.assertEqual(len(self.calls_for("macdeployqt")), 1)
+        self.assertFalse(self.calls_for("codesign"))
+        self.assertFalse(self.calls_for("create-dmg"))
 
     def test_failed_build_deploy_or_signing_never_creates_dmg(self):
         for tool, phase in (("cmake", ""), ("make", "build"), ("make", "install"),
